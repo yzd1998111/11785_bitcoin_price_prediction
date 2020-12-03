@@ -12,14 +12,13 @@ from tqdm import tqdm
 import collections
 import string
 import time
-import nltk
 import sys
 import time
 from torch.nn import Parameter
 from functools import wraps
 from datetime import datetime, timedelta
-nltk.download('punkt')
 
+load_embed = True
 V = 2
 MODEL_PATH = 'encoder/infersent%s.pkl' % V
 params_model = {'bsize': 64, 'word_emb_dim': 300, 'enc_lstm_dim': 2048,
@@ -29,42 +28,127 @@ W2V_PATH = 'fastText/crawl-300d-2M.vec'
 infersent_model = InferSent(params_model)
 infersent_model.load_state_dict(torch.load(MODEL_PATH))
 infersent_model.set_w2v_path(W2V_PATH)
-
+infersent_model.build_vocab_k_words(K=300000)
 start = time.time()
 comments_df = pd.read_csv("comment/investing.csv", encoding='utf-8')
 comments = comments_df["Comment"].values
-infersent_model.build_vocab(comments, tokenize=True)
 print(f"constructing comment embedding for {len(comments)} comments")
-comment_embedding = infersent_model.encode(comments, tokenize=True)
+
+if not load_embed:
+    comment_embedding = infersent_model.encode(comments, tokenize=True)
+    np.save("comment_embedding.npy", comment_embedding)
+else:
+    comment_embedding = np.load("comment_embedding.npy")
+
 comment_embedding_dict = {comments[i]: comment_embedding[i] for i in range(len(comments))}
 print("embedding construction completed", time.time()-start)
 torch.cuda.empty_cache()
 # number of subprocesses to use for data loading
 num_workers = 0
 # how many samples per batch to load
-EPOCHS = 20
-HIDDEN_DIM = 256
-BATCH_SIZE = 2
-CONTEXT_SIZE = 4
+EPOCHS = 100
+HIDDEN_DIM = 64
+BATCH_SIZE = 4
+WINDOW_SIZE = 14
+
 
 IN_FEATURES = 4096
 OUT_FEATURES = 2
 
-BLCK1_FILTER = 128
-BLCK2_FILTER = 256
+BLCK1_FILTER = 64
+BLCK2_FILTER = 128
+
+
+class BitcoinDataset(Dataset):
+    def __init__(self, comment_file = "", price_file = "", transform=None):
+        self.comment_file = comment_file
+        self.price_file = price_file
+
+        self.comment_dict = collections.defaultdict(list) 
+        self.X = []
+        self.X_lens = []
+        self.Y = []
+        
+        self.comment = pd.read_csv(comment_file, encoding='utf-8') if comment_file else None
+        self.price = pd.read_csv(price_file, encoding='utf-8') if price_file else None
+
+        self.max_len = 0
+        self.min_len = sys.maxsize
+        self.size = 0
+
+        start_date = datetime.strptime("2017-09-04", "%Y-%m-%d") + timedelta(days=WINDOW_SIZE) 
+        first_date, last_date = "", ""
+
+        for idx, row in self.comment.iterrows():
+            cur_date = datetime.strptime(row["Timestamp"], "%Y-%m-%d") 
+            self.comment_dict[row["Timestamp"]].append( (idx, row["Comment"]) )
+
+
+        for idx, row in self.price.iterrows():
+            cur_date = datetime.strptime(row["Timestamp"], "%Y-%m-%d")
+            if cur_date >= start_date:
+                self.size += 1
+
+                comments_in_window_from_cur_date = [[] for i in range(WINDOW_SIZE)]
+                for i in range(WINDOW_SIZE):
+                    prev_date = (cur_date - timedelta(days=i)).strftime("%Y-%m-%d")
+                    for (comment_idx, comment) in self.comment_dict[prev_date]:
+                        comments_in_window_from_cur_date[WINDOW_SIZE - 1 - i].append(torch.Tensor(comment_embedding[comment_idx][:]).unsqueeze(0))
+                for i in range(WINDOW_SIZE):
+                    comments_in_window_from_cur_date[i] = torch.mean(torch.stack(comments_in_window_from_cur_date[i]), dim=0)
+
+                comments_in_window_from_cur_date = torch.cat(comments_in_window_from_cur_date, dim=0)
+                self.X.append(comments_in_window_from_cur_date)
+                self.X_lens.append(WINDOW_SIZE)
+                
+                self.Y.append(torch.tensor(int(row["Change"])))
+        print(self.X[0].shape)
+        self.X = pad_sequence(self.X, batch_first=True)
+        del self.comment_dict, self.price, self.comment
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.X_lens[idx], self.Y[idx])
+
+
+class Attention(nn.Module):
+    def __init__(self, feature_dim, step_dim, batch_size, **kwargs):
+        super(Attention, self).__init__(**kwargs)
+
+        self.feature_dim = feature_dim
+        self.step_dim = step_dim
+        self.batch_size = batch_size
+
+        weight = torch.zeros(self.feature_dim, 1)
+        nn.init.kaiming_uniform_(weight)
+        self.weight = nn.Parameter(weight, requires_grad=True)
+
+
+    def forward(self, x, mask=None):
+        feature_dim = self.feature_dim
+        step_dim = self.step_dim
+        energy = torch.mm(x.contiguous().view(-1, self.feature_dim),self.weight).view(-1, self.step_dim)
+        energy = torch.tanh(energy)
+        attention  = torch.exp(energy)
+        attention = attention / (torch.sum(attention, 1, keepdim=True) + 1e-10)
+        weighted_input = x * torch.unsqueeze(attention, -1)
+        return torch.sum(weighted_input, 1)
+
 
 class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.conv1 = nn.Conv1d(in_channels, out_channels, 3, 1, 1)
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm1d(out_channels)
 
-        self.conv2 = nn.Conv1d(out_channels, out_channels, 3, 1, 1)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
         self.bn2 = nn.BatchNorm1d(out_channels)
 
-        self.conv_tmp = nn.Conv1d(in_channels, out_channels, 1, 1, 0)
+        self.conv_tmp = nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
         self.bn_tmp = nn.BatchNorm1d(out_channels)
 
     def forward(self, x):
@@ -136,124 +220,51 @@ class Model(nn.Module):
         self.res6 = ResBlock(BLCK2_FILTER, BLCK2_FILTER)
         self.bn6 = nn.BatchNorm1d(BLCK2_FILTER)
 
-        self.lstm = WeightDrop(torch.nn.LSTM(BLCK2_FILTER, self.hidden_size, self.num_layers, batch_first=True), [f'weight_hh_l{i}' for i in range(self.num_layers)], dropout=0.65)
+        self.lstm = WeightDrop(torch.nn.LSTM(BLCK2_FILTER, self.hidden_size, self.num_layers, batch_first=True, bias=True), [f'weight_hh_l{i}' for i in range(self.num_layers)], dropout=0.3)
+        self.drop = nn.Dropout(p=0.3)
 
-
-        self.fc1 = nn.Linear(hidden_size, 128)
-        self.fc2 = nn.Linear(128, out_features)
+        self.attn = Attention(self.hidden_size, WINDOW_SIZE, BATCH_SIZE)
+        self.decoder = nn.Linear(self.hidden_size, out_features)
     
 
     def forward(self, X, lengths):
         batch_size, seq_len, embedding_dim = X.shape
+        X = self.drop(X)
         X = X.transpose(1,2)
         X = self.bn1(self.res1(X))
         X = self.bn2(self.res2(X))
         X = self.bn3(self.res3(X))
-
+        
         X = self.bn4(self.res4(X))
         X = self.bn5(self.res5(X))
         X = self.bn6(self.res6(X))
         X = X.transpose(1,2)
 
         packed_X = pack_padded_sequence(X, lengths, enforce_sorted=False, batch_first=True)
-        packed_out = self.lstm(packed_X)[0]
+        packed_out, hidden = self.lstm(packed_X)
 
         out, out_lens = pad_packed_sequence(packed_out, batch_first=True)
-
-        seq_indicies = [l - 1 for l in out_lens]
-        batch_indicies = [i for i in range(batch_size)]
-        out = out[batch_indicies,seq_indicies,:]
-
-        out = self.fc1(out)
-        out = self.fc2(out)
+        out = self.attn(out)
+        
+        out = self.decoder(out)
         out = F.log_softmax(out, dim=1)
         return out, out_lens
 
 
-class BitcoinDataset(Dataset):
-    def __init__(self, comment_file = "", price_file = "", transform=None):
-        self.comment_file = comment_file
-        self.price_file = price_file
-
-        self.comment_dict = collections.defaultdict(list) 
-        self.X = []
-        self.X_lens = []
-        self.Y_tmp = {}
-        self.Y = []
-        
-
-        self.comment = pd.read_csv(comment_file, encoding='utf-8') if comment_file else None
-        self.comment_embedding = []
-        self.comments = []
-        self.price = pd.read_csv(price_file, encoding='utf-8') if price_file else None
-
-        self.max_len = 0
-        self.min_len = sys.maxsize
-        self.size = 0
-
-        start_date = datetime.strptime("2017-09-15", "%Y-%m-%d")
-        first_date, last_date = "", ""
-
-        for idx, row in self.price.iterrows():
-            cur_date = datetime.strptime(row["Timestamp"], "%Y-%m-%d")
-            if cur_date >= start_date:
-                if len(first_date) == 0:
-                    first_date = (cur_date - timedelta(days=CONTEXT_SIZE)).strftime("%Y-%m-%d")
-                last_date = row["Timestamp"]
-                self.Y_tmp[row["Timestamp"]] = int(row["Change"])
-
-        self.comment = self.comment[(self.comment["Timestamp"]>= first_date) & (self.comment["Timestamp"]<=last_date)]
-        
-        for idx, row in self.comment.iterrows():
-            cur_date = datetime.strptime(row["Timestamp"], "%Y-%m-%d") 
-            for i in range(CONTEXT_SIZE):
-                next_date = cur_date + timedelta(days=i)
-                self.comment_dict[next_date.strftime("%Y-%m-%d")].append(row["Comment"])
-            self.comments.append(row["Comment"])
-
-        for k in sorted(self.Y_tmp.keys()):
-            self.size += 1
-
-            context_comments = self.comment_dict[k]
-            context_comments_embeddings = []
-            for comment in context_comments:
-                context_comments_embeddings.append(comment_embedding_dict[comment][:])
-
-            self.X.append(torch.Tensor(context_comments_embeddings))
-            # self.X.append(context_comments)
-            self.X_lens.append(len(context_comments))
-            self.max_len = max(self.max_len, len(context_comments))
-            self.min_len = min(self.min_len, len(context_comments))
-
-
-            self.Y.append(torch.tensor(self.Y_tmp[k]))
- 
-        self.X = pad_sequence(self.X, batch_first=True)
-        del self.comments, self.Y_tmp, self.comment_dict, self.price, self.comment
-        print(self.max_len, self.min_len)
-
-    def __len__(self):
-        return self.size
-
-    def __getitem__(self, idx):
-        return (self.X[idx], self.X_lens[idx], self.Y[idx])
-        
-
 # choose the training and test datasets
-train_data = BitcoinDataset('comment/investing.csv', 'price/price_train.csv')
-val_data = BitcoinDataset('comment/investing.csv', 'price/price_val.csv')
-# test_data = BitcoinDataset('talk.csv', 'price_dev.csv')
+train_data = BitcoinDataset('comment/investing.csv', 'price/price_train_new.csv')
+val_data = BitcoinDataset('comment/investing.csv', 'price/price_val_new.csv')
 
 # prepare data loaders
 train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, num_workers=num_workers, shuffle=True, drop_last=True)
 val_loader = DataLoader(val_data, batch_size=BATCH_SIZE, num_workers=num_workers, shuffle=False, drop_last=True)
-# test_loader = DataLoader(test_data, batch_size=BATCH_SIZE, num_workers=num_workers, shuffle=False)
 
 model = Model(IN_FEATURES, OUT_FEATURES, HIDDEN_DIM).cuda()
-print(model.parameters())
 criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=5e-5)
-
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+total_params = sum(p.numel() for p in model.parameters())
+print(model)
+print(f"total parameters:{total_params}")
 
 def train():
     model.train()
@@ -274,15 +285,14 @@ def train():
             loss = criterion(out, Y)
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 2)
             optimizer.step()
             train_loss += loss.item()
-
+            
             pred = torch.argmax(out, dim=1)
             train_correct += torch.sum(torch.eq(pred, Y))     
           
-            cnt += 1
-
-        print('Epoch', epoch + 1, 'Train Loss', train_loss, 'Correct', train_correct / (1.0 * len(train_loader.dataset)))
+        print('Epoch', epoch + 1, 'Train Loss', train_loss / len(train_loader) , 'Correct', train_correct / (1.0 * len(train_loader.dataset)))
         val_loss, val_acc = validate()
         train_acc = train_correct / (1.0 * len(train_loader.dataset))
         train_losses.append(train_loss)
@@ -291,7 +301,7 @@ def train():
         val_accuracies.append(val_acc.item())
         model.train()
     torch.save(model.state_dict(), "./model.pth")
-    # test()
+    
     plt.figure(0)
     plt.plot(range(1, EPOCHS + 1), train_losses, label='Training losses')
     plt.plot(range(1, EPOCHS + 1), val_losses, label='Validation losses')
@@ -306,7 +316,7 @@ def train():
     plt.xlabel('Epochs')
     plt.ylabel('Accuracy')
     x1,x2,y1,y2 = plt.axis()
-    plt.axis((x1,x2,0.0,1.0))
+    plt.axis((x1,x2,0.4,1.0))
     plt.legend()
     plt.savefig('lstm_acc.png')
 
@@ -328,27 +338,10 @@ def validate():
 
             val_correct += torch.sum(torch.eq(pred, Y))     
         val_acc = val_correct / (1.0 * len(val_loader.dataset))
-        print('Val Loss', val_loss, 'Correct', val_acc)
+        print('Val Loss', val_loss / len(val_loader), 'Correct', val_acc)
         return val_loss, val_acc
-
-# def test():
-#     model.eval() # prep model for *evaluation*
-#     decoder = CTCBeamDecoder(['$'] * (N_PHONEMES + 1), beam_width=10, log_probs_input=True)
-#     with torch.no_grad():
-#         with open('submission.csv', mode='w') as submission:
-#             writer = csv.writer(submission, delimiter=',')
-#             row = 0
-#             writer.writerow(['id', 'label'])
-#             for X, X_lens in test_loader:
-#                 X, X_lens = X.cuda(), X_lens.cuda()
-#                 out, out_lens = model(X, X_lens)
-#                 test_Y, _, _, test_Y_lens = decoder.decode(out, out_lens)
-#                 for i in range(BATCH_SIZE):
-#                     best_seq = val_Y[i, 0, :val_Y_lens[i,0]]
-#                     best_pron = ''.join(PHONEME_MAP[j] for j in best_seq)
-#                     writer.writerow([row, best_pron])
-#                     row += 1
 
 
 if __name__ == "__main__":
     train()
+
